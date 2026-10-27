@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Email address checker</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23243a5e'/%3E%3Cpath d='M8 17l5 5 11-12' fill='none' stroke='%23fff' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
@@ -46,6 +47,11 @@ td.addr{font-family:"IBM Plex Mono",monospace;font-size:.9rem;word-break:break-a
 .pill.delivered{background:var(--ok-bg);color:var(--ok)}
 .pill.bounce{background:var(--bad-bg);color:var(--bad)}
 .pill.unknown{background:var(--unk-bg);color:var(--unk)}
+.pill.pending{background:var(--line);color:var(--muted)}
+.note{color:var(--muted);font-size:.9rem;margin-top:.25rem}
+.actions{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.75rem 0}
+button.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+#progress{color:var(--muted);font-size:.9rem;margin-left:.25rem}
 .legend{margin-top:1.5rem;color:var(--muted);font-size:.9rem;max-width:38rem}
 [hidden]{display:none!important}
 @media (prefers-reduced-motion:no-preference){button{transition:opacity .15s}}
@@ -71,43 +77,102 @@ td.addr{font-family:"IBM Plex Mono",monospace;font-size:.9rem;word-break:break-a
 
   <div id="out" hidden>
     <div id="summary" aria-live="polite"></div>
+    <div class="actions">
+      <button class="secondary" id="csv" type="button">Download CSV</button>
+      <button class="secondary" id="recheck" type="button" hidden>Re-check temporary results</button>
+      <span id="progress" aria-live="polite"></span>
+    </div>
     <div class="table-wrap">
       <table>
         <thead><tr><th scope="col">Address</th><th scope="col">Result</th><th scope="col">Why</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </div>
-    <p class="legend"><strong>Unknown</strong> is a normal result. Many mail servers, including large providers, won't say whether a mailbox exists, and some accept every address.</p>
+    <p class="legend"><strong>Unknown</strong> is a normal result. Many mail servers, including large providers, won't say whether a mailbox exists, and some accept every address. If a server asked us to try again later (greylisting), wait a few minutes and use <em>Re-check temporary results</em>.</p>
   </div>
 </main>
 <script>
 const LABEL = {delivered:"Likely delivered", bounce:"Likely to bounce", unknown:"Unknown"};
 const $ = id => document.getElementById(id);
+const rowsEl = $("rows");
+const table = new Map();   // address -> {tr, data}
+let running = false;
+
 const pill = s => { const e = document.createElement("span"); e.className = "pill " + s; e.textContent = LABEL[s]; return e; };
 
-$("go").addEventListener("click", async () => {
-  const btn = $("go"), err = $("error");
-  err.hidden = true; btn.disabled = true; btn.textContent = "Checking…";
+function setRow(addr, r) {
+  let rec = table.get(addr);
+  if (!rec) {
+    const tr = rowsEl.insertRow();
+    tr.insertCell().className = "addr"; tr.insertCell(); tr.insertCell();
+    tr.cells[0].textContent = addr;
+    rec = {tr, data: null}; table.set(addr, rec);
+  }
+  rec.data = r;
+  const res = rec.tr.cells[1], why = rec.tr.cells[2];
+  res.replaceChildren(); why.replaceChildren();
+  if (!r) {
+    const p = document.createElement("span"); p.className = "pill pending"; p.textContent = "Checking…";
+    res.appendChild(p); return;
+  }
+  res.appendChild(pill(r.status));
+  why.append(r.reason);
+  for (const n of r.notes || []) { const d = document.createElement("div"); d.className = "note"; d.textContent = n; why.appendChild(d); }
+}
+
+function refresh() {
+  const counts = {delivered:0, bounce:0, unknown:0}; let done = 0, temp = 0;
+  for (const {data} of table.values()) if (data) { counts[data.status]++; done++; if (data.temporary) temp++; }
+  const sum = $("summary"); sum.replaceChildren();
+  for (const k of ["delivered","bounce","unknown"]) { const p = pill(k); p.textContent = counts[k] + " " + LABEL[k].toLowerCase(); sum.appendChild(p); }
+  $("progress").textContent = running ? `Checked ${done} of ${table.size}` : "";
+  $("recheck").hidden = running || temp === 0;
+  $("recheck").textContent = `Re-check ${temp} temporary result${temp === 1 ? "" : "s"}`;
+  $("csv").disabled = done === 0;
+}
+
+function showError(msg) { const e = $("error"); e.textContent = msg; e.hidden = false; }
+
+async function run(text, merge) {
+  running = true; $("go").disabled = true; $("recheck").hidden = true; $("error").hidden = true;
+  $("go").textContent = "Checking…";
   try {
-    const res = await fetch("/check", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({text:$("input").value})});
-    const data = await res.json();
-    if (!res.ok) { err.textContent = data.error || "Something went wrong. Try again."; err.hidden = false; return; }
-    $("banner").hidden = data.smtp;
-    const counts = {delivered:0, bounce:0, unknown:0};
-    const rows = $("rows"); rows.replaceChildren();
-    for (const r of data.results) {
-      counts[r.status]++;
-      const tr = rows.insertRow();
-      tr.insertCell().textContent = r.address; tr.cells[0].className = "addr";
-      tr.insertCell().appendChild(pill(r.status));
-      tr.insertCell().textContent = r.reason;
-    }
-    const sum = $("summary"); sum.replaceChildren();
-    for (const k of ["delivered","bounce","unknown"]) { const p = pill(k); p.textContent = counts[k] + " " + LABEL[k].toLowerCase(); sum.appendChild(p); }
+    const res = await fetch("/check/stream", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({text})});
+    if (!res.ok) { const d = await res.json().catch(() => ({})); showError(d.error || "Something went wrong. Try again."); return; }
+    if (!merge) { table.clear(); rowsEl.replaceChildren(); }
     $("out").hidden = false;
+    const reader = res.body.getReader(), dec = new TextDecoder(); let buf = "";
+    const handle = m => {
+      if (m.addresses) { $("banner").hidden = m.smtp; m.addresses.forEach(a => setRow(a, null)); }
+      else setRow(m.address, m);
+      refresh();
+    };
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream:true});
+      let i; while ((i = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) handle(JSON.parse(line)); }
+    }
   } catch (e) {
-    err.textContent = "Could not reach the server. Check your connection and try again."; err.hidden = false;
-  } finally { btn.disabled = false; btn.textContent = "Check addresses"; }
+    showError("The connection dropped before all results arrived. Check your connection and try again.");
+  } finally {
+    for (const [a, rec] of table) if (!rec.data) setRow(a, {address:a, status:"unknown", reason:"The check did not finish", temporary:true, notes:[]});
+    running = false; $("go").disabled = false; $("go").textContent = "Check addresses"; refresh();
+  }
+}
+
+$("go").addEventListener("click", () => run($("input").value, false));
+$("recheck").addEventListener("click", () => {
+  const list = [...table].filter(([, r]) => r.data && r.data.temporary).map(([a]) => a);
+  if (list.length) run(list.join("\n"), true);
+});
+
+const csvCell = v => { v = String(v ?? ""); if (/^[=+\-@]/.test(v)) v = "'" + v; return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+$("csv").addEventListener("click", () => {
+  const lines = [["address","result","reason","notes"].join(",")];
+  for (const [a, {data}] of table) if (data) lines.push([a, LABEL[data.status], data.reason, (data.notes || []).join(" ")].map(csvCell).join(","));
+  const url = URL.createObjectURL(new Blob([lines.join("\r\n")], {type:"text/csv"}));
+  const link = document.createElement("a"); link.href = url; link.download = "email-check-results.csv"; link.click();
+  URL.revokeObjectURL(url);
 });
 </script>
 </body>
