@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Email address checker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f5f6f8; --surface:#ffffff; --ink:#1a2230; --muted:#5b6575; --line:#d9dde4;
+  --ok:#17663f; --ok-bg:#e1f3e8; --bad:#a3231b; --bad-bg:#fbe5e3; --unk:#7a5200; --unk-bg:#fdf0cc;
+  --accent:#243a5e; --focus:#1b6ef3;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#12161d; --surface:#1b212b; --ink:#e8ebf0; --muted:#9aa5b5; --line:#2f3745;
+    --ok:#6fd49b; --ok-bg:#16301f; --bad:#ff9d94; --bad-bg:#3a1b19; --unk:#f0c761; --unk-bg:#352a0e;
+    --accent:#9db7e6; --focus:#7aa7ff;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "IBM Plex Sans",system-ui,sans-serif}
+main{max-width:46rem;margin:0 auto;padding:2.5rem 1.25rem 4rem}
+h1{font-size:1.75rem;line-height:1.2;margin:0 0 .5rem}
+.lede{color:var(--muted);margin:0 0 1.5rem;max-width:38rem}
+.banner{border:1px solid var(--unk);background:var(--unk-bg);color:var(--unk);padding:.75rem 1rem;border-radius:6px;margin-bottom:1.5rem;font-size:.95rem}
+.banner strong{display:block}
+label{display:block;font-weight:600;margin-bottom:.4rem}
+textarea{width:100%;min-height:11rem;padding:.75rem;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font:.95rem/1.5 "IBM Plex Mono",monospace;resize:vertical}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.row{display:flex;gap:1rem;align-items:center;margin-top:.75rem;flex-wrap:wrap}
+button{background:var(--accent);color:var(--bg);border:0;border-radius:6px;padding:.65rem 1.25rem;font:600 1rem "IBM Plex Sans",sans-serif;cursor:pointer}
+button:disabled{opacity:.6;cursor:progress}
+.hint{color:var(--muted);font-size:.9rem}
+#error{color:var(--bad);margin-top:.75rem;font-weight:600}
+#summary{margin:2rem 0 .75rem;display:flex;gap:.5rem;flex-wrap:wrap}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:34rem}
+th,td{text-align:left;padding:.65rem .85rem;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+th{font-size:.9rem;color:var(--muted);font-weight:600}
+td.addr{font-family:"IBM Plex Mono",monospace;font-size:.9rem;word-break:break-all}
+.pill{display:inline-block;padding:.15rem .6rem;border-radius:999px;font-size:.85rem;font-weight:600;white-space:nowrap}
+.pill.delivered{background:var(--ok-bg);color:var(--ok)}
+.pill.bounce{background:var(--bad-bg);color:var(--bad)}
+.pill.unknown{background:var(--unk-bg);color:var(--unk)}
+.legend{margin-top:1.5rem;color:var(--muted);font-size:.9rem;max-width:38rem}
+[hidden]{display:none!important}
+@media (prefers-reduced-motion:no-preference){button{transition:opacity .15s}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Email address checker</h1>
+  <p class="lede">Paste a list of addresses and see which are likely to be delivered, likely to bounce, or can't be determined. No email is ever sent.</p>
+
+  <div class="banner" id="banner" {% if smtp %}hidden{% endif %}>
+    <strong>Mailbox checks are off on this server.</strong>
+    This host blocks connections to mail servers, so addresses are only checked for valid format and a working mail domain. Anything that passes is shown as Unknown.
+  </div>
+
+  <label for="input">Email addresses</label>
+  <textarea id="input" placeholder="one@example.com&#10;two@example.org" spellcheck="false" autocomplete="off"></textarea>
+  <div class="row">
+    <button id="go">Check addresses</button>
+    <span class="hint">Up to {{ max_addresses }} at a time. Separate with new lines, commas or spaces.</span>
+  </div>
+  <div id="error" role="alert" hidden></div>
+
+  <div id="out" hidden>
+    <div id="summary" aria-live="polite"></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">Address</th><th scope="col">Result</th><th scope="col">Why</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p class="legend"><strong>Unknown</strong> is a normal result. Many mail servers, including large providers, won't say whether a mailbox exists, and some accept every address.</p>
+  </div>
+</main>
+<script>
+const LABEL = {delivered:"Likely delivered", bounce:"Likely to bounce", unknown:"Unknown"};
+const $ = id => document.getElementById(id);
+const pill = s => { const e = document.createElement("span"); e.className = "pill " + s; e.textContent = LABEL[s]; return e; };
+
+$("go").addEventListener("click", async () => {
+  const btn = $("go"), err = $("error");
+  err.hidden = true; btn.disabled = true; btn.textContent = "Checking…";
+  try {
+    const res = await fetch("/check", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({text:$("input").value})});
+    const data = await res.json();
+    if (!res.ok) { err.textContent = data.error || "Something went wrong. Try again."; err.hidden = false; return; }
+    $("banner").hidden = data.smtp;
+    const counts = {delivered:0, bounce:0, unknown:0};
+    const rows = $("rows"); rows.replaceChildren();
+    for (const r of data.results) {
+      counts[r.status]++;
+      const tr = rows.insertRow();
+      tr.insertCell().textContent = r.address; tr.cells[0].className = "addr";
+      tr.insertCell().appendChild(pill(r.status));
+      tr.insertCell().textContent = r.reason;
+    }
+    const sum = $("summary"); sum.replaceChildren();
+    for (const k of ["delivered","bounce","unknown"]) { const p = pill(k); p.textContent = counts[k] + " " + LABEL[k].toLowerCase(); sum.appendChild(p); }
+    $("out").hidden = false;
+  } catch (e) {
+    err.textContent = "Could not reach the server. Check your connection and try again."; err.hidden = false;
+  } finally { btn.disabled = false; btn.textContent = "Check addresses"; }
+});
+</script>
+</body>
+</html>
