@@ -5,6 +5,9 @@ Layers, stopping at the first verdict:
   2. DNS lookup (MX records, falling back to A/AAAA)
   3. SMTP probe: RCPT TO only, then disconnect. No message is ever sent.
 """
+import difflib
+import json
+import logging
 import os
 import random
 import re
@@ -37,6 +40,25 @@ POLICY_WORDS = ("spam", "block", "blacklist", "denied", "policy", "rbl",
                 "reputation", "blocked", "listed", "5.7.", "not allowed",
                 "relay", "authenticat", "greylist")
 
+COMMON_DOMAINS = [
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
+    "aol.com", "live.com", "msn.com", "mail.com", "proton.me",
+    "protonmail.com", "yahoo.co.in", "yahoo.co.uk", "hotmail.co.uk",
+]
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "temp-mail.org", "yopmail.com", "trashmail.com", "sharklasers.com",
+    "getnada.com", "throwawaymail.com", "dispostable.com", "maildrop.cc",
+    "fakeinbox.com", "mailnesia.com", "mintemail.com",
+}
+
+log = logging.getLogger("checker")
+
+
+def log_event(event, **fields):
+    """One JSON object per log line, easy to search in Render's Logs tab."""
+    log.info(json.dumps({"event": event, **fields}, default=str))
+
 
 def check_syntax(address):
     """Return an error string, or None if the address looks valid."""
@@ -59,6 +81,28 @@ def check_syntax(address):
     if not (labels[-1].isalpha() or labels[-1].startswith("xn--")) or len(labels[-1]) < 2:
         return "Domain ending is not valid"
     return None
+
+
+def suggest_domain(domain):
+    """Return a likely intended domain for a typo like gmial.com, else None."""
+    domain = domain.lower()
+    if domain in COMMON_DOMAINS:
+        return None
+    match = difflib.get_close_matches(domain, COMMON_DOMAINS, n=1, cutoff=0.85)
+    return match[0] if match else None
+
+
+def domain_notes(address):
+    """Extra, non-verdict hints shown under the reason."""
+    local, domain = address.rsplit("@", 1)
+    domain = domain.lower()
+    notes = []
+    suggestion = suggest_domain(domain)
+    if suggestion:
+        notes.append(f"Did you mean {local}@{suggestion}?")
+    if domain in DISPOSABLE_DOMAINS:
+        notes.append("Disposable email service: these addresses are temporary")
+    return notes
 
 
 def lookup_mail_hosts(domain):
@@ -116,6 +160,7 @@ def smtp_available():
                 except OSError:
                     continue
             _port25["value"] = ok
+            log_event("port25_check", reachable=ok)
         return _port25["value"]
 
 
@@ -125,20 +170,25 @@ def _is_policy_refusal(text):
 
 
 def _classify_rcpt(code, message):
+    """Return (status, reason, temporary) for a RCPT TO reply."""
     text = message.decode("utf-8", "replace") if isinstance(message, bytes) else str(message)
     if code in (250, 251):
-        return DELIVERED, "Mail server accepted this mailbox"
+        return DELIVERED, "Mail server accepted this mailbox", False
     if 400 <= code < 500:
-        return UNKNOWN, "Server asked to try again later (temporary reply or greylisting)"
+        return UNKNOWN, "Server asked to try again later (temporary reply or greylisting)", True
     if code in (550, 551, 553) and not _is_policy_refusal(text):
-        return BOUNCE, "Mail server says this mailbox does not exist"
+        return BOUNCE, "Mail server says this mailbox does not exist", False
     if code == 552:
-        return UNKNOWN, "Mailbox exists but may be full"
-    return UNKNOWN, "Server refused to answer for this mailbox"
+        return UNKNOWN, "Mailbox exists but may be full", False
+    return UNKNOWN, "Server refused to answer for this mailbox", False
 
 
 def smtp_probe(hosts, address, catchall_cache):
-    """Ask the mail server whether it would accept `address`. Sends no mail."""
+    """Ask the mail server whether it would accept `address`. Sends no mail.
+
+    Returns (status, reason, temporary). Only MAIL FROM and RCPT TO are used;
+    the DATA command is never issued.
+    """
     domain = address.rsplit("@", 1)[1].lower()
     last_error = "Could not connect to the domain's mail server"
     for host in hosts[:2]:
@@ -148,9 +198,9 @@ def smtp_probe(hosts, address, catchall_cache):
             server.ehlo_or_helo_if_needed()
             code, _ = server.mail(MAIL_FROM)
             if code != 250:
-                return UNKNOWN, "Server refused the probe before checking the mailbox"
+                return UNKNOWN, "Server refused the probe before checking the mailbox", 400 <= code < 500
             code, msg = server.rcpt(address)
-            status, reason = _classify_rcpt(code, msg)
+            status, reason, temporary = _classify_rcpt(code, msg)
             if status == DELIVERED:
                 if domain not in catchall_cache:
                     server.rset()
@@ -158,54 +208,61 @@ def smtp_probe(hosts, address, catchall_cache):
                     c2, _ = server.rcpt(f"zz-{junk}@{domain}")
                     catchall_cache[domain] = c2 in (250, 251)
                 if catchall_cache[domain]:
-                    return UNKNOWN, "Server accepts every address on this domain, so this one can't be confirmed"
-            return status, reason
+                    return UNKNOWN, "Server accepts every address on this domain, so this one can't be confirmed", False
+            return status, reason, temporary
         except (smtplib.SMTPException, OSError) as exc:
             last_error = f"Mail server did not respond ({type(exc).__name__})"
+            log_event("smtp_error", host=host, error=type(exc).__name__)
         finally:
             try:
                 server.quit()
             except Exception:
                 server.close()
-    return UNKNOWN, last_error
+    return UNKNOWN, last_error, True
+
+
+def _result(address, status, reason, temporary=False, notes=None):
+    return {"address": address, "status": status, "reason": reason,
+            "temporary": temporary, "notes": notes or []}
+
+
+def _check_address(address, probe_enabled, hosts_cache, catchall_cache, state):
+    err = check_syntax(address)
+    if err:
+        return _result(address, BOUNCE, err)
+    domain = address.rsplit("@", 1)[1].lower()
+    notes = domain_notes(address)
+    if domain not in hosts_cache:
+        hosts_cache[domain] = lookup_mail_hosts(domain)
+    hosts, status, reason = hosts_cache[domain]
+    if hosts is None:
+        return _result(address, status, reason, temporary=(status == UNKNOWN), notes=notes)
+    if not probe_enabled:
+        return _result(address, UNKNOWN,
+                       "Domain can receive mail, but mailbox checks are off on this server",
+                       notes=notes)
+    if state["probed"]:
+        time.sleep(DELAY_BETWEEN_PROBES)
+    state["probed"] = True
+    status, reason, temporary = smtp_probe(hosts, address, catchall_cache)
+    return _result(address, status, reason, temporary, notes)
+
+
+def iter_group(addresses, probe_enabled):
+    """Yield one result per address. Addresses share a domain and are checked
+    one at a time, so a mail server is never hit in parallel. A failure on one
+    address is reported for that address only."""
+    hosts_cache, catchall_cache, state = {}, {}, {"probed": False}
+    for address in addresses:
+        try:
+            result = _check_address(address, probe_enabled, hosts_cache, catchall_cache, state)
+        except Exception as exc:  # last resort: report, don't crash
+            result = _result(address, UNKNOWN, f"Check failed unexpectedly ({type(exc).__name__})", temporary=True)
+        domain = address.rsplit("@", 1)[-1][:100].lower() if "@" in address else "-"
+        log_event("address_checked", domain=domain, status=result["status"],
+                  reason=result["reason"], temporary=result["temporary"])
+        yield result
 
 
 def check_group(addresses, probe_enabled):
-    """Check addresses that share a domain, one at a time and politely."""
-    try:
-        return _check_group(addresses, probe_enabled)
-    except Exception as exc:  # last resort: report, don't crash
-        return [_result(a, UNKNOWN, f"Check failed unexpectedly ({type(exc).__name__})") for a in addresses]
-
-
-def _check_group(addresses, probe_enabled):
-    out = []
-    hosts_cache = {}
-    catchall_cache = {}
-    probed_before = False
-    for address in addresses:
-        err = check_syntax(address)
-        if err:
-            out.append(_result(address, BOUNCE, err))
-            continue
-        domain = address.rsplit("@", 1)[1].lower()
-        if domain not in hosts_cache:
-            hosts_cache[domain] = lookup_mail_hosts(domain)
-        hosts, status, reason = hosts_cache[domain]
-        if hosts is None:
-            out.append(_result(address, status, reason))
-            continue
-        if not probe_enabled:
-            out.append(_result(address, UNKNOWN,
-                               "Domain can receive mail, but mailbox checks are off on this server"))
-            continue
-        if probed_before:
-            time.sleep(DELAY_BETWEEN_PROBES)
-        probed_before = True
-        status, reason = smtp_probe(hosts, address, catchall_cache)
-        out.append(_result(address, status, reason))
-    return out
-
-
-def _result(address, status, reason):
-    return {"address": address, "status": status, "reason": reason}
+    return list(iter_group(addresses, probe_enabled))
