@@ -64,8 +64,11 @@ def check_syntax(address):
 def lookup_mail_hosts(domain):
     """Return (hosts, error_status, reason). hosts is an ordered list or None."""
     domain = domain.encode("idna").decode("ascii")
-    resolver = dns.resolver.Resolver()
-    resolver.lifetime = DNS_TIMEOUT
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = DNS_TIMEOUT
+    except Exception:
+        return None, UNKNOWN, "This server has no working DNS configuration"
     try:
         answers = resolver.resolve(domain, "MX")
         records = sorted((r.preference, str(r.exchange).rstrip(".")) for r in answers)
@@ -169,6 +172,13 @@ def smtp_probe(hosts, address, catchall_cache):
 
 def check_group(addresses, probe_enabled):
     """Check addresses that share a domain, one at a time and politely."""
+    try:
+        return _check_group(addresses, probe_enabled)
+    except Exception as exc:  # last resort: report, don't crash
+        return [_result(a, UNKNOWN, f"Check failed unexpectedly ({type(exc).__name__})") for a in addresses]
+
+
+def _check_group(addresses, probe_enabled):
     out = []
     hosts_cache = {}
     catchall_cache = {}
