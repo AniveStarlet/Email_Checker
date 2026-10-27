@@ -16,6 +16,14 @@ Each address goes through three layers and stops at the first verdict.
 
 **Why "unknown" is normal.** Many mail servers, including large providers, won't confirm whether a mailbox exists, or accept every address. In those cases the honest answer is "unknown", and the interface says so.
 
+## Extra features
+
+- **Live results.** Results stream in row by row (`POST /check/stream`), so long lists show progress instead of a blank wait. `POST /check` returns the same data as one JSON response.
+- **Typo suggestions.** `sam@gmial.com` gets a "Did you mean sam@gmail.com?" note. Suggestions never change the verdict.
+- **Disposable-domain flag.** A short built-in list of throwaway-mail services (Mailinator and similar) adds a warning note.
+- **Re-check temporary results.** When a server answers "try again later" (greylisting) or doesn't respond, the result is Unknown and marked temporary. Greylisting often clears after a few minutes, so wait and press **Re-check**; only those addresses are re-run.
+- **CSV download** of the current table.
+
 Politeness limits: at most 50 addresses per request, 8-second connection timeouts, only the first two mail servers per domain are tried, and probes to the same domain are spaced one second apart.
 
 ## What the deployed version can and cannot check
@@ -58,6 +66,14 @@ Run the tests with `python -m unittest discover`. They mock the network, so they
 2. In Render, choose **New > Blueprint** (or **New > Web Service**) and select the repo. `render.yaml` sets the build and start commands and the free plan.
 3. Open the `onrender.com` URL once deployed. The first request after idle time can take 30 to 60 seconds.
 
+## Logging
+
+Each log line is one JSON object, searchable in Render's **Logs** tab. Events: `port25_check`, `request`, `address_checked`, `smtp_error`, `request_done`. Lines record the **domain** and verdict only, never the part before the `@`.
+
+## Health check
+
+`GET /health` returns `{"status": "ok"}`.
+
 ## Responsible use
 
 Only check addresses you have a reason to check. The probe contacts third-party mail servers, so don't run it against large lists you don't own, and don't use it to send messages.
@@ -67,5 +83,5 @@ Only check addresses you have a reason to check. The probe contacts third-party 
 - `app.py`: Flask routes and input parsing
 - `checker.py`: syntax, DNS and SMTP logic
 - `templates/index.html`: the single-page interface
-- `tests/`: unit tests
+- `tests/`: unit tests (network is mocked)
 - `render.yaml`: Render deployment config
