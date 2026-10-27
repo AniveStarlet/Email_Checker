@@ -3,6 +3,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
 import checker
 
@@ -14,16 +15,32 @@ def parse_addresses(text):
     """Split pasted text on whitespace, commas and semicolons; drop duplicates."""
     seen, out = set(), []
     for token in re.split(r"[\s,;]+", text or ""):
-        token = token.strip("<>\"'()[]").removeprefix("mailto:")
+        token = token.strip("<>\"'()[]")
+        if token.lower().startswith("mailto:"):
+            token = token[7:]
         if token and token.lower() not in seen:
             seen.add(token.lower())
             out.append(token)
     return out
 
 
+@app.errorhandler(Exception)
+def on_error(exc):
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("Unhandled error")
+    if request.path == "/check":
+        return jsonify(error="The check failed on the server. Try fewer addresses."), 500
+    return "Something went wrong. Check the server logs.", 500
+
+
 @app.get("/")
 def index():
-    return render_template("index.html", smtp=checker.smtp_available(), max_addresses=MAX_ADDRESSES)
+    try:
+        smtp = checker.smtp_available()
+    except Exception:
+        smtp = False
+    return render_template("index.html", smtp=smtp, max_addresses=MAX_ADDRESSES)
 
 
 @app.post("/check")
@@ -34,7 +51,10 @@ def check():
     if len(addresses) > MAX_ADDRESSES:
         return jsonify(error=f"Please check {MAX_ADDRESSES} addresses or fewer at a time."), 400
 
-    probe = checker.smtp_available()
+    try:
+        probe = checker.smtp_available()
+    except Exception:
+        probe = False
     groups = defaultdict(list)
     for a in addresses:
         groups[a.rsplit("@", 1)[-1].lower()].append(a)
@@ -47,3 +67,4 @@ def check():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
